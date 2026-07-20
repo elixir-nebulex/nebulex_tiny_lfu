@@ -57,9 +57,9 @@ The segment sizes follow Caffeine's defaults from `BoundedLocalCache.java`:
   │  ├── AccessOrderDeque  (Probation)                      │
   │  ├── AccessOrderDeque  (Protected)                      │
   │  └── Maintenance.Supervisor (:rest_for_one)             │
-  │        ├── Maintenance Queue  (PB.Queue, 1 partition)   │
-  │        ├── Read Buffer        (PB.Map, N partitions)    │
-  │        └── Write Buffer       (PB.Map, N partitions)    │
+  │        ├── Maintenance Queue  (Tidefall.Queue)          │
+  │        ├── Read Buffer        (Tidefall.HashMap)        │
+  │        └── Write Buffer       (Tidefall.HashMap)        │
   └─────────────────────────────────────────────────────────┘
 ```
 
@@ -95,15 +95,15 @@ See `Nebulex.TinyLFU.AccessOrderDeque`.
 A 3-tier pipeline that decouples the hot path (cache reads/writes) from the
 cold path (maintenance/eviction):
 
-1. **Read Buffer** (`PartitionedBuffer.Map`): Captures read events with
+1. **Read Buffer** (`Tidefall.HashMap`): Captures read events with
    deduplication. Multiple partitions for scalability. Lossy — dropping a
    read event only means one missed LRU touch.
 
-2. **Write Buffer** (`PartitionedBuffer.Map`): Captures write and delete
+2. **Write Buffer** (`Tidefall.HashMap`): Captures write and delete
    events with deduplication. Lossless — write events cannot be dropped as
    they affect size accounting and eviction.
 
-3. **Maintenance Queue** (`PartitionedBuffer.Queue`, 1 partition): Ordered
+3. **Maintenance Queue** (`Tidefall.Queue`, 1 partition): Ordered
    queue that serializes all maintenance work. A single processor drains
    events and updates the deques, running eviction and admission as needed.
 
@@ -275,9 +275,9 @@ Nebulex.TinyLFU.Supervisor (:rest_for_one)
   ├── AccessOrderDeque  (Probation)
   ├── AccessOrderDeque  (Protected)
   └── Nebulex.TinyLFU.Maintenance.Supervisor (:rest_for_one)
-        ├── Maintenance Queue  (PB.Queue, 1 partition)
-        ├── Read Buffer        (PB.Map, N partitions)
-        └── Write Buffer       (PB.Map, N partitions)
+        ├── Maintenance Queue  (Tidefall.Queue, 1 partition)
+        ├── Read Buffer        (Tidefall.HashMap, N partitions)
+        └── Write Buffer       (Tidefall.HashMap, N partitions)
 ```
 
 **Why two supervisors?**
@@ -308,15 +308,19 @@ corruption. The two-table approach gives O(log n) touch (ETS `ordered_set` is
 a C-level AVL tree, `log2(1M) ~ 20` comparisons) with simpler code and fewer
 failure modes.
 
-### Why PartitionedBuffer instead of ring buffers?
+### Why Tidefall instead of ring buffers?
 
 Caffeine uses striped ring buffers for reads and an MPSC queue for writes. We
-use `PartitionedBuffer.Map` with `put_newer` which provides:
+use `Tidefall.HashMap` with `put_newer` which provides:
 
 - **Deduplication**: 1000 writes to the same key = 1 entry in the buffer.
 - **Partitioned ETS**: One table per CPU for write scalability.
 - **Double-buffering**: Zero-downtime processing — new events go to a fresh
   table while the old one is being drained.
+- **Arbitrary-term keys**: the `:key_hasher` buffer option (default `true`,
+  `:erlang.phash2`) lets any term be used as a cache key; a custom `fun/1`
+  gives collision-free key identity. Early draining can be tuned with
+  `:drain_threshold` / `:drain_check_interval`.
 
 ### Why a single-partition Maintenance Queue?
 
@@ -329,7 +333,7 @@ ETS table concurrently (`:public` with `write_concurrency: true`).
 
 ### Why MFA tuples instead of closures for processors?
 
-PartitionedBuffer processors are configured at startup and invoked repeatedly.
+Tidefall processors are configured at startup and invoked repeatedly.
 MFA tuples (`{Module, :function, [args]}`) are more explicit, easier to inspect
 in crash logs, and avoid capturing large terms in closure environments.
 
@@ -338,5 +342,5 @@ in crash logs, and avoid capturing large terms in closure environments.
 - [TinyLFU: A Highly Efficient Cache Admission Policy](https://dl.acm.org/citation.cfm?id=3149371)
 - [An Improved Data Stream Summary: The Count-Min Sketch and its Applications](http://dimacs.rutgers.edu/~graham/pubs/papers/cm-full.pdf)
 - [Caffeine](https://github.com/ben-manes/caffeine) by Ben Manes
-- [PartitionedBuffer](https://github.com/appcues/partitioned_buffer) — ETS-based
-  partitioned buffer with double-buffering
+- [Tidefall](https://github.com/cabol/tidefall) — ETS-based partitioned buffer
+  with double-buffering and coalescing (a maintained fork of PartitionedBuffer)

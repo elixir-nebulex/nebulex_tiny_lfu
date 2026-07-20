@@ -28,7 +28,7 @@ defmodule Nebulex.Adapters.TinyLFU do
       next read; no per-entry timers.
     * **Standard Nebulex queryable, info, observable, and stats support.**
     * **Pluggable runtime** — built on `:ets` with `:atomics` for the sketch
-      and `PartitionedBuffer` for the read/write event buffers.
+      and `Tidefall` for the read/write event buffers.
 
   ## How W-TinyLFU works
 
@@ -48,18 +48,19 @@ defmodule Nebulex.Adapters.TinyLFU do
   ### Hot path vs. cold path
 
   ```ascii
-    cache.get/put/delete    ┌────────────────┐         ┌────────────┐
-    ────────────────────▶   │  ETS Data Tab  │ + event │ Read/Write │
-    (direct, lock-free)     │   (key,val,…)  │ ──────▶ │   Buffers  │
-                            └────────────────┘         │ (PB.Map,   │
-                                                       │  deduped)  │
-                                                       └─────┬──────┘
+    cache.get/put/delete    ┌────────────────┐         ┌──────────────┐
+    ────────────────────▶   │  ETS Data Tab  │ + event │  Read/Write  │
+    (direct, lock-free)     │   (key,val,…)  │ ──────▶ │   Buffers    │
+                            └────────────────┘         │ (Tidefall.   │
+                                                       │  HashMap,    │
+                                                       │  deduped)    │
+                                                       └─────┬────────┘
                                                              │ flush
                                                              ▼
                                             ┌──────────────────────────┐
                                             │   Maintenance Queue      │
-                                            │   (PB.Queue, single      │
-                                            │    writer processor)     │
+                                            │   (Tidefall.Queue,       │
+                                            │    single-writer proc)   │
                                             └────────────┬─────────────┘
                                                          │ drain batch
                           ┌──────────────────────────────┼──────────────────────────────┐
@@ -71,7 +72,7 @@ defmodule Nebulex.Adapters.TinyLFU do
   ```
 
     * **Hot path** (`cache.get/put/delete`): direct ETS lookup/insert/delete,
-      plus a `PartitionedBuffer.Map.put_newer` to enqueue the access event.
+      plus a `Tidefall.HashMap.put_newer` to enqueue the access event.
       Returns immediately. Reads and writes never serialise through a
       process.
     * **Cold path** (maintenance worker): on each flush cycle, buffered
@@ -204,10 +205,16 @@ defmodule Nebulex.Adapters.TinyLFU do
       one process. Maintenance throughput scales with unique keys per
       flush window, not raw op rate (the buffers deduplicate). For most
       workloads this is plenty; for extreme key-cardinality bursts, tune
-      `:processing_interval_ms` and `:processing_batch_size` (see options
+      `:processing_interval` and `:processing_batch_size` (see options
       above).
     * **No `:replace` in `put_all/2`.** `put_all` supports `:put` and
       `:put_new`. Use single-key `replace/3` for conditional updates.
+    * **Complex keys.** Any term works as a cache key out of the box: the
+      internal buffers hash keys via the `:key_hasher` buffer option, which
+      defaults to `true` (`:erlang.phash2`). Set it to a `fun/1` for
+      collision-free key identity, or `false` to disable hashing on
+      simple-key-only caches (see the `:key_hasher` option under
+      Configuration Options).
 
   ## References
 
@@ -272,6 +279,13 @@ defmodule Nebulex.Adapters.TinyLFU do
     name = opts[:name] || cache
     max_size = Keyword.get(opts, :max_size)
 
+    # The buffer key hasher (`true` by default; `false` to disable, or a
+    # fun/1 — see `:key_hasher` in the options docs). Tidefall's `:key_hasher`
+    # is a per-call runtime option rather than a buffer start option, so it is
+    # carried here and threaded onto every buffer operation on the hot path.
+    # Tidefall accepts the boolean directly, so no translation is needed.
+    buffer_key_hasher = get_in(opts, [:buffer_opts, :key_hasher])
+
     # Init stats_counter
     stats_counter =
       if Keyword.fetch!(opts, :stats) == true do
@@ -297,6 +311,7 @@ defmodule Nebulex.Adapters.TinyLFU do
       stats_counter: stats_counter,
       data_tab: data_tab,
       max_size: max_size,
+      buffer_key_hasher: buffer_key_hasher,
       started_at: DateTime.utc_now()
     }
 
@@ -922,10 +937,13 @@ defmodule Nebulex.Adapters.TinyLFU do
     :ok
   end
 
-  defp schedule_read(%{name: name}, key) do
+  defp schedule_read(%{name: name, buffer_key_hasher: key_hasher}, key) do
     name
     |> Maintenance.read_buffer_name()
-    |> PartitionedBuffer.Map.put_newer(key, :read, System.monotonic_time())
+    |> Tidefall.HashMap.put_newer(key, :read,
+      version: System.monotonic_time(),
+      key_hasher: key_hasher
+    )
   end
 
   # Skip eviction when the cache is unbounded
@@ -933,10 +951,13 @@ defmodule Nebulex.Adapters.TinyLFU do
     :ok
   end
 
-  defp schedule_write(%{name: name}, key, value) do
+  defp schedule_write(%{name: name, buffer_key_hasher: key_hasher}, key, value) do
     name
     |> Maintenance.write_buffer_name()
-    |> PartitionedBuffer.Map.put_newer(key, {:write, value}, System.monotonic_time())
+    |> Tidefall.HashMap.put_newer(key, {:write, value},
+      version: System.monotonic_time(),
+      key_hasher: key_hasher
+    )
   end
 
   # Skip eviction when the cache is unbounded
@@ -944,13 +965,13 @@ defmodule Nebulex.Adapters.TinyLFU do
     :ok
   end
 
-  defp schedule_write_all(%{name: name}, entries) do
+  defp schedule_write_all(%{name: name, buffer_key_hasher: key_hasher}, entries) do
     version = System.monotonic_time()
     entries = Enum.map(entries, fn {key, value} -> {key, {:write, value}, version} end)
 
     name
     |> Maintenance.write_buffer_name()
-    |> PartitionedBuffer.Map.put_all_newer(entries)
+    |> Tidefall.HashMap.put_all_newer(entries, key_hasher: key_hasher)
   end
 
   # Skip eviction when the cache is unbounded
@@ -958,10 +979,13 @@ defmodule Nebulex.Adapters.TinyLFU do
     :ok
   end
 
-  defp schedule_delete(%{name: name}, key) do
+  defp schedule_delete(%{name: name, buffer_key_hasher: key_hasher}, key) do
     name
     |> Maintenance.write_buffer_name()
-    |> PartitionedBuffer.Map.put_newer(key, :delete, System.monotonic_time())
+    |> Tidefall.HashMap.put_newer(key, :delete,
+      version: System.monotonic_time(),
+      key_hasher: key_hasher
+    )
   end
 
   # Skip eviction when the cache is unbounded
@@ -969,13 +993,13 @@ defmodule Nebulex.Adapters.TinyLFU do
     :ok
   end
 
-  defp schedule_delete_all(%{name: name}, keys) do
+  defp schedule_delete_all(%{name: name, buffer_key_hasher: key_hasher}, keys) do
     version = System.monotonic_time()
     entries = Enum.map(keys, fn key -> {key, :delete, version} end)
 
     name
     |> Maintenance.write_buffer_name()
-    |> PartitionedBuffer.Map.put_all_newer(entries)
+    |> Tidefall.HashMap.put_all_newer(entries, key_hasher: key_hasher)
   end
 
   # Skip eviction when the cache is unbounded
@@ -983,13 +1007,16 @@ defmodule Nebulex.Adapters.TinyLFU do
     :ok
   end
 
+  # The flush sentinel is a fixed atom, so it needs no key hashing — and we
+  # deliberately do NOT hash it. Leaving it unhashed keeps it a distinct ETS
+  # term (an atom) that can never collide with a hashed user key (an integer,
+  # under the default `phash2` hasher), so a colliding user write can't
+  # coalesce away the whole-cache flush event emitted by `delete_all/1`.
   defp schedule_flush(%{name: name}) do
     name
     |> Maintenance.write_buffer_name()
-    |> PartitionedBuffer.Map.put_newer(
-      Maintenance.flush_key(),
-      :flush_all,
-      System.monotonic_time()
+    |> Tidefall.HashMap.put_newer(Maintenance.flush_key(), :flush_all,
+      version: System.monotonic_time()
     )
   end
 end
