@@ -48,28 +48,35 @@ defmodule Nebulex.Adapters.TinyLFU.Options do
       required: false,
       default: [],
       doc: """
-      Options for the internal read/write buffers and maintenance queue.
-      These are passed through to `PartitionedBuffer`. The maintenance
-      queue always overrides `:partitions` to 1 (single-writer guarantee).
+      Options for the internal read/write buffers and maintenance queue,
+      passed through to `Tidefall`. The maintenance queue always overrides
+      `:partitions` to 1 (single-writer guarantee).
+
+      See Tidefall for the full semantics of each option —
+      [start options](https://tidefall.hexdocs.pm/Tidefall.HashMap.html#module-start-options)
+      (`:processing_interval`, `:processing_timeout`, `:processing_batch_size`,
+      `:partitions`, `:drain_threshold`, `:drain_check_interval`) and
+      [runtime options](https://tidefall.hexdocs.pm/Tidefall.HashMap.html#module-runtime-options)
+      (`:key_hasher`). The per-option docs below only note where this adapter's
+      default or behavior differs from Tidefall's.
       """,
       keys: [
-        processing_interval_ms: [
+        processing_interval: [
           type: :pos_integer,
           required: false,
           default: :timer.seconds(1),
           doc: """
-          How often (in milliseconds) each partition checks its buffer and
-          initiates processing. Lower values mean faster processing but more
-          frequent task spawning.
+          Buffer drain interval, in milliseconds. Defaults to 1 second here
+          (Tidefall's own default is 5 seconds).
           """
         ],
-        processing_timeout_ms: [
+        processing_timeout: [
           type: :timeout,
           required: false,
           default: :timer.seconds(30),
           doc: """
-          Maximum time (in milliseconds) for a processing task to complete
-          before being forcefully terminated.
+          Processing-task timeout, in milliseconds. Defaults to 30 seconds
+          here (Tidefall's own default is 1 minute).
           """
         ],
         processing_batch_size: [
@@ -77,17 +84,52 @@ defmodule Nebulex.Adapters.TinyLFU.Options do
           required: false,
           default: 100,
           doc: """
-          Number of entries to read from the buffer per batch. The processor
-          is called once per batch.
+          Entries read from the buffer per batch. Defaults to 100 here
+          (Tidefall's own default is 10).
           """
         ],
         partitions: [
           type: :pos_integer,
           required: false,
           doc: """
-          Number of buffer partitions for read and write buffers. More
-          partitions reduce lock contention but increase per-partition
-          overhead.
+          Number of partitions for the read and write buffers. No adapter
+          default — uses Tidefall's (`System.schedulers_online()`).
+          """
+        ],
+        drain_threshold: [
+          type: :pos_integer,
+          required: false,
+          doc: """
+          Optional per-partition item count that triggers an early drain, in
+          addition to the interval timer. Disabled (interval-only) by default.
+          """
+        ],
+        drain_check_interval: [
+          type: :pos_integer,
+          required: false,
+          doc: """
+          Poll interval (ms) for the early-drain size check. Only relevant
+          when `:drain_threshold` is set; keep it below `:processing_interval`.
+          """
+        ],
+        key_hasher: [
+          type: {:or, [:boolean, {:fun, 1}]},
+          required: false,
+          default: true,
+          doc: """
+          How cache keys are hashed for the internal buffers. This adapter
+          **defaults to `true`** (`:erlang.phash2`), unlike Tidefall's own
+          `false` default, so any term works as a cache key out of the box —
+          the versioned buffer path otherwise raises on map-containing keys.
+          Pass `false` to disable hashing on simple-key-only caches, or a
+          `fun/1` (e.g. `&:erlang.term_to_binary(&1, [:deterministic])`) for
+          collision-free key identity.
+
+          Cache-specific caveat: with `true`, a rare 28-bit `phash2` collision
+          can — under very high key cardinality — leave an entry untracked by
+          the eviction policy, so it is not counted toward `:max_size` until
+          its TTL or an explicit delete (cached **values** are never affected).
+          Use a collision-free `fun/1` if that matters for your workload.
           """
         ]
       ]

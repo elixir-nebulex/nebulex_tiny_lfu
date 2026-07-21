@@ -2,7 +2,7 @@ defmodule Nebulex.TinyLFU.Maintenance do
   @moduledoc """
   Processor callbacks and eviction/admission logic for the W-TinyLFU policy.
 
-  Contains the functions invoked by `PartitionedBuffer` via MFA tuples:
+  Contains the functions invoked by `Tidefall` via MFA tuples:
 
     * `process_buffer/2` — drains read/write buffer entries and pushes
       them to the maintenance queue.
@@ -38,6 +38,7 @@ defmodule Nebulex.TinyLFU.Maintenance do
   import Nebulex.Utils, only: [camelize_and_concat: 1]
 
   alias Nebulex.TinyLFU.{AccessOrderDeque, FrequencySketch}
+  alias Tidefall.HashMap.Entry
 
   # Holds the frequency sketch, deque references, segment capacities,
   # and optional ETS data table for the maintenance processor.
@@ -83,17 +84,19 @@ defmodule Nebulex.TinyLFU.Maintenance do
   @doc false
   def write_buffer_name(name), do: camelize_and_concat([name, WriteBuffer])
 
-  ## Processor callbacks (called via MFA by PartitionedBuffer)
+  ## Processor callbacks (called via MFA by Tidefall)
 
   @doc false
-  @spec process_buffer([{any(), any(), any(), any()}], atom()) :: :ok
+  @spec process_buffer([Entry.t()], atom()) :: :ok
   def process_buffer(batch, queue_name) do
     # Forward the buffer's `updates` counter so the maintenance worker can
     # tick the frequency sketch once per coalesced event. Drop `version`;
-    # the maintenance pipeline doesn't use it.
+    # the maintenance pipeline doesn't use it. `Entry.key` is always the
+    # original (pre-hash) key, so the queue sees user keys regardless of the
+    # configured `:key_hasher`.
     batch
-    |> Enum.map(fn {key, value, _version, updates} -> {key, value, updates} end)
-    |> then(&PartitionedBuffer.Queue.push(queue_name, &1))
+    |> Enum.map(fn %Entry{key: key, value: value, updates: updates} -> {key, value, updates} end)
+    |> then(&Tidefall.Queue.push(queue_name, &1))
   end
 
   @doc false

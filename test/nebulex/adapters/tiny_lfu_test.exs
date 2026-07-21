@@ -6,8 +6,7 @@ defmodule Nebulex.Adapters.TinyLFUTest do
     only: [
       Nebulex.Cache.KVTest,
       Nebulex.Cache.KVExpirationTest,
-      # TODO: Enable KVPropTest once PartitionedBuffer supports map keys
-      # Nebulex.Cache.KVPropTest,
+      Nebulex.Cache.KVPropTest,
       Nebulex.Cache.QueryableTest,
       Nebulex.Cache.QueryableExpirationTest,
       Nebulex.Cache.QueryableQueryErrorTest
@@ -18,6 +17,11 @@ defmodule Nebulex.Adapters.TinyLFUTest do
   import Nebulex.CacheCase, only: [setup_with_dynamic_cache: 3]
 
   alias Nebulex.Adapters.TinyLFU.TestCache, as: Cache
+
+  # Shared fixture: a key with a NESTED map — the case that breaks ETS
+  # match-spec equality on the versioned buffer path, so it's the real
+  # exercise of the :key_hasher option.
+  @map_key %{tenant: "acme", id: %{region: "us-east", shard: 7}}
 
   setup_with_dynamic_cache Cache, :tiny_lfu_test, max_size: 1_000
 
@@ -56,6 +60,117 @@ defmodule Nebulex.Adapters.TinyLFUTest do
       assert cache.put!(:key4, %{v: 1}) == :ok
       assert cache.replace!(:key4, %{v: 2, extra: %{nested: true}}) == true
       assert cache.fetch!(:key4) == %{v: 2, extra: %{nested: true}}
+    end
+  end
+
+  describe "map keys (default key_hasher: true)" do
+    test "put/fetch/delete and re-access a map-containing key", %{cache: cache} do
+      # First write, then a second write on the SAME map key — without hashing
+      # this second write would raise; the default hasher makes it work.
+      assert cache.put!(@map_key, 1) == :ok
+      assert cache.put!(@map_key, 2) == :ok
+      assert cache.fetch!(@map_key) == 2
+
+      # Reads and deletes on the map key also round-trip.
+      assert cache.fetch!(@map_key) == 2
+      assert cache.delete!(@map_key) == :ok
+      assert {:error, %Nebulex.KeyError{}} = cache.fetch(@map_key)
+    end
+
+    test "map nested inside a tuple key", %{cache: cache} do
+      key = {:user, %{id: 1}}
+
+      assert cache.put!(key, "a") == :ok
+      assert cache.put!(key, "b") == :ok
+      assert cache.fetch!(key) == "b"
+    end
+
+    test "batch put_all!/delete_all with map-containing keys", %{cache: cache} do
+      k1 = %{tenant: "a", id: %{shard: 1}}
+      k2 = %{tenant: "b", id: %{shard: 2}}
+
+      # Bulk path goes through schedule_write_all -> Tidefall.HashMap.put_all_newer,
+      # which must thread the same key_hasher as the single-key path.
+      assert cache.put_all!(%{k1 => 1, k2 => 2}) == :ok
+      assert cache.fetch!(k1) == 1
+      assert cache.fetch!(k2) == 2
+
+      assert cache.delete_all!(in: [k1, k2]) == 2
+      assert {:error, %Nebulex.KeyError{}} = cache.fetch(k1)
+      assert {:error, %Nebulex.KeyError{}} = cache.fetch(k2)
+    end
+  end
+
+  describe "key_hasher: custom fun (collision-free)" do
+    setup do
+      cache_name = :tiny_lfu_custom_hasher
+      default = Cache.get_dynamic_cache()
+
+      pid =
+        {Cache,
+         [
+           name: cache_name,
+           max_size: 100,
+           # A collision-free, deterministic hasher for exact key identity in
+           # the policy layer (the fun/1 override of the default phash2).
+           buffer_opts: [key_hasher: &:erlang.term_to_binary(&1, [:deterministic])]
+         ]}
+        |> Supervisor.child_spec(id: cache_name)
+        |> start_supervised!()
+
+      _ = Cache.put_dynamic_cache(cache_name)
+      on_exit(fn -> Cache.put_dynamic_cache(default) end)
+
+      %{cache: Cache, pid: pid}
+    end
+
+    test "map-containing keys round-trip with a custom hasher", %{cache: cache} do
+      assert cache.put!(@map_key, 1) == :ok
+      assert cache.put!(@map_key, 2) == :ok
+      assert cache.fetch!(@map_key) == 2
+      assert cache.delete!(@map_key) == :ok
+    end
+  end
+
+  describe "key_hasher: false (hashing disabled)" do
+    setup do
+      cache_name = :tiny_lfu_no_hasher
+      default = Cache.get_dynamic_cache()
+
+      pid =
+        {Cache,
+         [
+           name: cache_name,
+           max_size: 100,
+           # Disable hashing. Use a long interval so both writes of a key land
+           # in the same flush window (the map-key raise happens on the 2nd
+           # same-window versioned write).
+           buffer_opts: [key_hasher: false, processing_interval: 60_000]
+         ]}
+        |> Supervisor.child_spec(id: cache_name)
+        |> start_supervised!()
+
+      _ = Cache.put_dynamic_cache(cache_name)
+      on_exit(fn -> Cache.put_dynamic_cache(default) end)
+
+      %{cache: Cache, pid: pid}
+    end
+
+    test "simple keys work with hashing disabled", %{cache: cache} do
+      assert cache.put!(:simple, 1) == :ok
+      assert cache.put!(:simple, 2) == :ok
+      assert cache.fetch!(:simple) == 2
+      assert cache.delete!(:simple) == :ok
+    end
+
+    test "a second write on a nested-map key raises when hashing is disabled",
+         %{cache: cache} do
+      # First write succeeds (insert-new path); the second same-window write
+      # hits Tidefall's select_replace, which can't express a map key in the
+      # replacement position. This pins the documented `key_hasher: false`
+      # limitation so it can't silently change.
+      assert cache.put!(@map_key, 1) == :ok
+      assert_raise ArgumentError, fn -> cache.put!(@map_key, 2) end
     end
   end
 
@@ -233,7 +348,7 @@ defmodule Nebulex.Adapters.TinyLFUTest do
           # for the maintenance pipeline to drain.
           name: cache_name,
           max_size: 100,
-          buffer_opts: [processing_interval_ms: 5, processing_batch_size: 200]
+          buffer_opts: [processing_interval: 5, processing_batch_size: 200]
         }
         |> Supervisor.child_spec(id: cache_name)
         |> start_supervised!()

@@ -13,9 +13,9 @@ defmodule Nebulex.TinyLFU.Maintenance.Supervisor do
   ## Children
 
       Maintenance.Supervisor (:rest_for_one)
-        ├── Maintenance Queue  (PB.Queue, 1 partition)
-        ├── Read Buffer        (PB.Map, N partitions)
-        └── Write Buffer       (PB.Map, N partitions)
+        ├── Maintenance Queue  (Tidefall.Queue, 1 partition)
+        ├── Read Buffer        (Tidefall.HashMap, N partitions)
+        └── Write Buffer       (Tidefall.HashMap, N partitions)
 
   """
 
@@ -26,12 +26,17 @@ defmodule Nebulex.TinyLFU.Maintenance.Supervisor do
   alias Nebulex.TinyLFU.{AccessOrderDeque, FrequencySketch, Maintenance}
   alias Nebulex.TinyLFU.Supervisor, as: TinyLFUSupervisor
 
-  # PartitionedBuffer options we pass through from the adapter
+  # Tidefall buffer start options we pass through from the adapter.
+  # Note: `:key_hasher` is deliberately excluded — it is a Tidefall *runtime*
+  # option (per put_newer/put_all_newer call), not a buffer start option, so
+  # it is threaded through the adapter's hot-path writes instead.
   @buffer_option_keys [
-    :processing_interval_ms,
+    :processing_interval,
     :partitions,
-    :processing_timeout_ms,
-    :processing_batch_size
+    :processing_timeout,
+    :processing_batch_size,
+    :drain_threshold,
+    :drain_check_interval
   ]
 
   ## API
@@ -112,9 +117,9 @@ defmodule Nebulex.TinyLFU.Maintenance.Supervisor do
     buffer_processor = {Maintenance, :process_buffer, [queue_name]}
 
     children = [
-      {PartitionedBuffer.Queue, [name: queue_name, processor: maint_processor] ++ queue_opts},
-      {PartitionedBuffer.Map, [name: r_buffer_name, processor: buffer_processor] ++ buffer_opts},
-      {PartitionedBuffer.Map, [name: w_buffer_name, processor: buffer_processor] ++ buffer_opts}
+      {Tidefall.Queue, [name: queue_name, processor: maint_processor] ++ queue_opts},
+      {Tidefall.HashMap, [name: r_buffer_name, processor: buffer_processor] ++ buffer_opts},
+      {Tidefall.HashMap, [name: w_buffer_name, processor: buffer_processor] ++ buffer_opts}
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)

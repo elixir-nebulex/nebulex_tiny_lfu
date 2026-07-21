@@ -48,7 +48,7 @@ defmodule NebulexTinyLfu.MixProject do
     [
       nebulex_dep(),
       {:nimble_options, "~> 0.5 or ~> 1.0"},
-      {:partitioned_buffer, "~> 0.4"},
+      {:tidefall, github: "cabol/tidefall", branch: "main"},
       {:telemetry, "~> 0.4 or ~> 1.0", optional: true},
 
       # Test & Code Analysis
