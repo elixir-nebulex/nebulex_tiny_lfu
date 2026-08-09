@@ -25,8 +25,10 @@ defmodule Nebulex.TinyLFU.Maintenance do
       Protected on access. Matches Caffeine's `onAccess()`.
     * `{key, {:write, value}, updates}` — increment the frequency sketch
       by `updates + 1`. If the key already exists in a deque, touch it
-      in place (like a read). Otherwise add to the Window deque; run
-      admission if Window is full.
+      in place (like a read). Otherwise add to the Window deque; when the
+      window exceeds its capacity, its LRU is promoted to Probation.
+      TinyLFU admission runs later, only under capacity pressure (see
+      `process_maintenance/2`).
     * `{key, :delete, _updates}` — remove the key from whichever deque
       it's in.
     * `{_key, :flush_all, _updates}` — whole-cache invalidation: wipe all
@@ -113,13 +115,27 @@ defmodule Nebulex.TinyLFU.Maintenance do
       end)
 
     :ok = Enum.each(flush_events, &process_event(&1, ctx))
-    :ok = Enum.each(other_events, &process_event(&1, ctx))
+
+    # Window-overflow promotions are collected (in promotion order) as this
+    # batch's admission candidates — Caffeine's evictFromMain() evaluates
+    # exactly the entries evictFromWindow() just promoted.
+    candidates =
+      other_events
+      |> Enum.reduce([], fn event, acc ->
+        case process_event(event, ctx) do
+          {:candidate, key} -> [key | acc]
+          _other -> acc
+        end
+      end)
+      |> Enum.reverse()
 
     # After processing the batch, enforce total cache size by evicting
     # entries until total_size <= max_size. Matches Caffeine's evictFromMain()
-    # with a `while (weightedSize() > maximum())` loop.
-    if ctx.data_tab && ctx.max_size > 0 do
-      evict_entries(ctx)
+    # with a `while (weightedSize() > maximum())` loop — including the
+    # candidate-vs-victim admission filter, which only runs here, under
+    # capacity pressure.
+    if ctx.max_size > 0 do
+      evict_entries(ctx, candidates)
     end
 
     :ok
@@ -223,69 +239,127 @@ defmodule Nebulex.TinyLFU.Maintenance do
     end
   end
 
-  # Evicts the LRU entry from window if it exceeds capacity, then runs
-  # the TinyLFU admission policy against probation's LRU.
+  # Promotes the window LRU into probation (at MRU) when the window exceeds
+  # capacity. Promotion is unconditional — matches Caffeine's
+  # evictFromWindow(), which moves overflow into probation without any
+  # admission check; the TinyLFU filter only runs later, under capacity
+  # pressure, in evict_entries/2. Returns the promoted key so the caller can
+  # collect it as an admission candidate for this batch.
   #
   # Note the `>` (not `>=`): the window briefly holds `window_max + 1`
-  # entries between the new key being added and this eviction step. Treat
+  # entries between the new key being added and this promotion step. Treat
   # `window_max` as a soft cap — the deque is never larger than that for
   # more than one event's worth of work in the maintenance batch.
   defp evict_from_window(ctx) do
     if AccessOrderDeque.size(ctx.window) > ctx.window_max do
-      {:ok, window_victim} = AccessOrderDeque.evict_lru(ctx.window)
-
-      admit_or_discard(window_victim, ctx)
-    end
-  end
-
-  # Admission: compare window victim vs probation LRU.
-  defp admit_or_discard(window_victim, ctx) do
-    case AccessOrderDeque.peek_lru(ctx.probation) do
-      {:ok, main_victim} ->
-        admit_candidate(window_victim, main_victim, ctx)
-
-      :empty ->
-        # Probation is empty — admit directly
-        AccessOrderDeque.put(ctx.probation, window_victim)
-    end
-  end
-
-  defp admit_candidate(candidate, victim, ctx) do
-    if FrequencySketch.frequency(ctx.sketch, candidate) >
-         FrequencySketch.frequency(ctx.sketch, victim) do
-      # Admit candidate to probation, evict victim
-      {:ok, ^victim} = AccessOrderDeque.evict_lru(ctx.probation)
+      {:ok, candidate} = AccessOrderDeque.evict_lru(ctx.window)
 
       AccessOrderDeque.put(ctx.probation, candidate)
-      maybe_delete(ctx.data_tab, victim)
+
+      {:candidate, candidate}
     else
-      # Discard candidate
-      maybe_delete(ctx.data_tab, candidate)
+      :ok
     end
   end
 
-  # Enforces total cache size after processing a batch. Evicts from
-  # probation LRU first, then protected LRU if probation is exhausted.
-  # Matches Caffeine's evictFromMain() loop.
-  defp evict_entries(ctx) do
+  # Enforces total cache size after processing a batch, mirroring Caffeine's
+  # evictFromMain(): while over capacity, this batch's window-promoted
+  # candidates (in promotion order) are compared against the probation LRU
+  # (the victim) via the frequency sketch, evicting whichever is less worthy.
+  # Once candidates are exhausted, plain LRU eviction applies — probation
+  # first, then protected, then window.
+  defp evict_entries(ctx, candidates) do
     total =
       AccessOrderDeque.size(ctx.window) +
         AccessOrderDeque.size(ctx.probation) +
         AccessOrderDeque.size(ctx.protected)
 
+    evict_entries(ctx, candidates, total)
+  end
+
+  # Every successful evict_one/2 removes exactly one entry across the three
+  # deques, so the running total is decremented instead of re-reading the
+  # three deque sizes (ETS info calls) on each iteration.
+  defp evict_entries(ctx, candidates, total) do
     if total > ctx.max_size do
-      evicted =
-        case AccessOrderDeque.evict_lru(ctx.probation) do
-          {:ok, key} -> key
-          :empty -> evict_fallback(ctx.protected, ctx.window)
-        end
-
-      if evicted do
-        maybe_delete(ctx.data_tab, evicted)
-
-        evict_entries(ctx)
+      case evict_one(ctx, candidates) do
+        {:cont, candidates} -> evict_entries(ctx, candidates, total - 1)
+        :halt -> :ok
       end
+    else
+      :ok
     end
+  end
+
+  defp evict_one(ctx, candidates) do
+    case next_candidate(ctx, candidates) do
+      {candidate, rest} -> {:cont, admit_or_evict(candidate, rest, ctx)}
+      :none -> evict_via_lru(ctx)
+    end
+  end
+
+  # No candidates left — evict the plain LRU victim. A `nil` victim (all
+  # deques empty) is unreachable while total > max_size, but halt instead
+  # of looping if it ever happens.
+  defp evict_via_lru(ctx) do
+    case evict_victim(ctx) do
+      nil -> :halt
+      _key -> {:cont, []}
+    end
+  end
+
+  # Next batch candidate still in probation. A candidate may have been
+  # deleted, or promoted to protected by a later event in the same batch —
+  # skip those.
+  defp next_candidate(_ctx, []) do
+    :none
+  end
+
+  defp next_candidate(ctx, [candidate | rest]) do
+    if AccessOrderDeque.member?(ctx.probation, candidate) do
+      {candidate, rest}
+    else
+      next_candidate(ctx, rest)
+    end
+  end
+
+  # TinyLFU admission under capacity pressure: evict the victim (probation
+  # LRU) when the candidate's frequency is strictly greater; otherwise evict
+  # the candidate (ties retain the victim, matching Caffeine). Either way the
+  # candidate is consumed — Caffeine advances the candidate pointer on both
+  # admit and reject. When the probation LRU is the candidate itself, the
+  # self-comparison falls into the reject branch and evicts the candidate.
+  defp admit_or_evict(candidate, rest, ctx) do
+    # Probation is non-empty: `candidate` is a member (see next_candidate/2)
+    {:ok, victim} = AccessOrderDeque.peek_lru(ctx.probation)
+
+    if FrequencySketch.frequency(ctx.sketch, candidate) >
+         FrequencySketch.frequency(ctx.sketch, victim) do
+      {:ok, ^victim} = AccessOrderDeque.remove(ctx.probation, victim)
+
+      maybe_delete(ctx.data_tab, victim)
+    else
+      {:ok, ^candidate} = AccessOrderDeque.remove(ctx.probation, candidate)
+
+      maybe_delete(ctx.data_tab, candidate)
+    end
+
+    rest
+  end
+
+  # Plain LRU eviction: probation first, then protected, then window.
+  defp evict_victim(ctx) do
+    evicted =
+      case AccessOrderDeque.evict_lru(ctx.probation) do
+        {:ok, key} -> key
+        :empty -> evict_fallback(ctx.protected, ctx.window)
+      end
+
+    if evicted do
+      maybe_delete(ctx.data_tab, evicted)
+    end
+
+    evicted
   end
 
   # Fallback eviction order: protected LRU, then window LRU
@@ -301,9 +375,9 @@ defmodule Nebulex.TinyLFU.Maintenance do
       {:ok, key} ->
         key
 
-      # Unreachable in practice: `evict_entries/1` only descends into
+      # Unreachable in practice: `evict_victim/1` only descends into
       # `evict_fallback_window` when probation and protected are empty,
-      # and at that point the recursion guard `total > max_size` (with
+      # and at that point the loop guard `total > max_size` (with
       # `max_size >= 1` since it's a `:pos_integer`) requires window to
       # hold at least one entry. The clause exists purely as a safety
       # net so a bug in the calling path can't crash the maintenance

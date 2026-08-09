@@ -77,20 +77,23 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       assert AccessOrderDeque.size(ctx.window) == 2
     end
 
-    test "window victim admitted to empty probation directly", ctx do
+    test "window victim is promoted to probation", ctx do
       process(
         [write_event(:a), write_event(:b)],
         ctx,
         window_max: 1
       )
 
-      # :a evicted from window, probation was empty → admitted directly
+      # :a evicted from window → promoted to probation (unconditionally,
+      # matching Caffeine's evictFromWindow)
       assert AccessOrderDeque.member?(ctx.probation, :a)
       assert AccessOrderDeque.member?(ctx.window, :b)
     end
 
-    test "sequential evictions fill probation or discard via admission", ctx do
-      # window_max=1: each write evicts the previous key
+    test "sequential window overflows all promote to probation under capacity", ctx do
+      # window_max=1: each write evicts the previous key. With no capacity
+      # pressure (max_size unset), nothing is ever discarded — admission
+      # only runs when the cache is over capacity.
       process(
         [write_event(:a), write_event(:b), write_event(:c), write_event(:d)],
         ctx,
@@ -101,26 +104,46 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       assert AccessOrderDeque.member?(ctx.window, :d)
       assert AccessOrderDeque.size(ctx.window) == 1
 
-      # Evicted keys either went to probation or were discarded by admission.
-      # Total across all deques should be <= 4 (some may have been discarded)
-      assert total_size(ctx) <= 4
-      assert total_size(ctx) >= 1
+      # All overflow victims live in probation — no writes were lost
+      for key <- [:a, :b, :c] do
+        assert AccessOrderDeque.member?(ctx.probation, key)
+      end
+
+      assert total_size(ctx) == 4
+    end
+
+    test "writes are never discarded while the cache is under capacity", ctx do
+      # Regression: admission used to run on every window overflow, so on a
+      # frequency tie new entries were discarded even with the cache nearly
+      # empty (500 puts on an empty 1000-cap cache left ~11 entries).
+      events = for i <- 1..20, do: write_event("key_#{i}")
+
+      process(events, ctx, window_max: 2, max_size: 100)
+
+      assert total_size(ctx) == 20
     end
   end
 
-  describe "write events — admission policy" do
-    test "admits window victim with higher frequency than main victim", ctx do
+  describe "write events — admission policy (over capacity)" do
+    # Admission only runs under capacity pressure (Caffeine's evictFromMain
+    # loop): the window-promoted candidate is compared against the probation
+    # LRU victim, and the less worthy of the two is evicted.
+
+    test "admits window candidate with higher frequency than main victim", ctx do
       # Give :high_freq a high frequency
       boost_frequency(ctx.sketch, :high_freq)
 
       # Put :low_freq in probation (will be the victim)
       AccessOrderDeque.put(ctx.probation, :low_freq)
 
-      # Write :high_freq (enters window), then :pusher evicts :high_freq
+      # Write :high_freq (enters window), then :pusher promotes :high_freq
+      # to probation as this batch's candidate. Total (3) > max_size (2)
+      # forces one admission round.
       process(
         [write_event(:high_freq), write_event(:pusher)],
         ctx,
-        window_max: 1
+        window_max: 1,
+        max_size: 2
       )
 
       # :high_freq admitted to probation, :low_freq evicted
@@ -128,21 +151,23 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       refute AccessOrderDeque.member?(ctx.probation, :low_freq)
     end
 
-    test "rejects window victim with lower frequency than main victim", ctx do
+    test "rejects window candidate with lower frequency than main victim", ctx do
       # Give :popular a high frequency
       boost_frequency(ctx.sketch, :popular)
 
       # Put :popular in probation
       AccessOrderDeque.put(ctx.probation, :popular)
 
-      # Write :unpopular (enters window), then :pusher evicts :unpopular
+      # Write :unpopular (enters window), then :pusher promotes :unpopular.
+      # Total (3) > max_size (2) forces one admission round.
       process(
         [write_event(:unpopular), write_event(:pusher)],
         ctx,
-        window_max: 1
+        window_max: 1,
+        max_size: 2
       )
 
-      # :popular retained, :unpopular discarded
+      # :popular retained, :unpopular evicted
       assert AccessOrderDeque.member?(ctx.probation, :popular)
       refute AccessOrderDeque.member?(ctx.probation, :unpopular)
       refute AccessOrderDeque.member?(ctx.window, :unpopular)
@@ -157,13 +182,14 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
 
       AccessOrderDeque.put(ctx.probation, :victim)
 
-      # Write :candidate, then :pusher evicts :candidate
+      # Write :candidate, then :pusher promotes :candidate.
       # freq(:candidate) = 1 (from the write), freq(:victim) = 1
       # Equal frequency → victim retained (candidate needs strictly greater)
       process(
         [write_event(:candidate), write_event(:pusher)],
         ctx,
-        window_max: 1
+        window_max: 1,
+        max_size: 2
       )
 
       assert AccessOrderDeque.member?(ctx.probation, :victim)
@@ -178,10 +204,12 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       # Give :candidate higher freq than :old
       boost_frequency(ctx.sketch, :candidate)
 
+      # Total (4) > max_size (3) forces one admission round.
       process(
         [write_event(:candidate), write_event(:pusher)],
         ctx,
-        window_max: 1
+        window_max: 1,
+        max_size: 3
       )
 
       # :candidate admitted, :old (LRU) evicted
@@ -189,6 +217,123 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       refute AccessOrderDeque.member?(ctx.probation, :old)
       # :newer should still be there
       assert AccessOrderDeque.member?(ctx.probation, :newer)
+    end
+
+    test "no admission (and no discard) while at or under max_size", ctx do
+      boost_frequency(ctx.sketch, :popular)
+      AccessOrderDeque.put(ctx.probation, :popular)
+
+      # Total after processing = 3 = max_size → no eviction pressure, both
+      # the candidate and the victim survive.
+      process(
+        [write_event(:unpopular), write_event(:pusher)],
+        ctx,
+        window_max: 1,
+        max_size: 3
+      )
+
+      assert AccessOrderDeque.member?(ctx.probation, :popular)
+      assert AccessOrderDeque.member?(ctx.probation, :unpopular)
+      assert AccessOrderDeque.member?(ctx.window, :pusher)
+    end
+
+    test "multiple candidates are evaluated in promotion order", ctx do
+      # Two hot victims in probation, then a batch that promotes two cold
+      # candidates: both candidates lose their admission rounds.
+      boost_frequency(ctx.sketch, :hot_1)
+      boost_frequency(ctx.sketch, :hot_2)
+      AccessOrderDeque.put(ctx.probation, :hot_1)
+      AccessOrderDeque.put(ctx.probation, :hot_2)
+
+      process(
+        [write_event(:cold_1), write_event(:cold_2), write_event(:pusher)],
+        ctx,
+        window_max: 1,
+        max_size: 3
+      )
+
+      assert AccessOrderDeque.member?(ctx.probation, :hot_1)
+      assert AccessOrderDeque.member?(ctx.probation, :hot_2)
+      refute AccessOrderDeque.member?(ctx.probation, :cold_1)
+      refute AccessOrderDeque.member?(ctx.probation, :cold_2)
+      assert AccessOrderDeque.member?(ctx.window, :pusher)
+    end
+
+    test "skips a candidate deleted later in the same batch", ctx do
+      # :x is promoted to probation as a candidate, then deleted by a later
+      # event in the same batch. The admission round must skip it and evict
+      # via plain LRU instead of asserting on a missing probation member.
+      AccessOrderDeque.put(ctx.probation, :old)
+
+      process(
+        [write_event(:x), write_event(:pusher), delete_event(:x)],
+        ctx,
+        window_max: 1,
+        max_size: 1
+      )
+
+      assert locate_key(ctx, :x) == :none
+      refute AccessOrderDeque.member?(ctx.probation, :old)
+      assert AccessOrderDeque.member?(ctx.window, :pusher)
+      assert total_size(ctx) == 1
+    end
+
+    test "skips a candidate promoted to protected later in the same batch", ctx do
+      # :y is promoted to probation as a candidate, then a read in the same
+      # batch promotes it to protected. The admission round must skip it and
+      # evict via plain LRU.
+      AccessOrderDeque.put(ctx.probation, :old)
+
+      process(
+        [write_event(:y), write_event(:pusher), read_event(:y)],
+        ctx,
+        window_max: 1,
+        max_size: 2
+      )
+
+      assert locate_key(ctx, :y) == :protected
+      refute AccessOrderDeque.member?(ctx.probation, :old)
+      assert AccessOrderDeque.member?(ctx.window, :pusher)
+      assert total_size(ctx) == 2
+    end
+
+    test "falls back to plain LRU when candidates run out mid-resolution", ctx do
+      # Two victims in probation, one candidate from the batch, and an
+      # eviction debt of two: the first round consumes the candidate via
+      # admission (it wins on frequency), the second round has no candidates
+      # left and must evict the remaining excess via plain LRU.
+      AccessOrderDeque.put(ctx.probation, :victim_1)
+      AccessOrderDeque.put(ctx.probation, :victim_2)
+
+      process(
+        [write_event(:cand), write_event(:pusher)],
+        ctx,
+        window_max: 1,
+        max_size: 2
+      )
+
+      # Admission round: freq(:cand) = 1 > freq(:victim_1) = 0 → victim_1 out
+      refute AccessOrderDeque.member?(ctx.probation, :victim_1)
+      # LRU fallback round: :victim_2 evicted with no candidates left
+      refute AccessOrderDeque.member?(ctx.probation, :victim_2)
+      assert AccessOrderDeque.member?(ctx.probation, :cand)
+      assert AccessOrderDeque.member?(ctx.window, :pusher)
+      assert total_size(ctx) == 2
+    end
+
+    test "candidates evict each other when only candidates remain in probation", ctx do
+      # Probation holds only this batch's promotions: the LRU victim IS the
+      # first candidate, so candidates get consumed against each other until
+      # the size cap is met.
+      process(
+        [write_event(:a), write_event(:b), write_event(:c), write_event(:pusher)],
+        ctx,
+        window_max: 1,
+        max_size: 2
+      )
+
+      assert AccessOrderDeque.member?(ctx.window, :pusher)
+      assert total_size(ctx) == 2
     end
   end
 
@@ -343,22 +488,23 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
     end
 
     test "stale read after eviction is a no-op", ctx do
-      # :a gets evicted from window and discarded by admission,
-      # then a stale read arrives
+      # :a gets promoted from window and evicted by admission under
+      # capacity pressure, then a stale read arrives
       boost_frequency(ctx.sketch, :victim_in_probation)
       AccessOrderDeque.put(ctx.probation, :victim_in_probation)
 
-      # Write :a then :b (evicts :a), :a loses admission → discarded
-      process([write_event(:a), write_event(:b)], ctx, window_max: 1)
+      # Write :a then :b (promotes :a); total (3) > max_size (2) → :a loses
+      # admission against the boosted victim and is evicted
+      process([write_event(:a), write_event(:b)], ctx, window_max: 1, max_size: 2)
 
-      if locate_key(ctx, :a) == :none do
-        # Stale read for :a — should be a no-op
-        size_before = total_size(ctx)
-        process([read_event(:a)], ctx)
+      assert locate_key(ctx, :a) == :none
 
-        assert locate_key(ctx, :a) == :none
-        assert total_size(ctx) == size_before
-      end
+      # Stale read for :a — should be a no-op
+      size_before = total_size(ctx)
+      process([read_event(:a)], ctx)
+
+      assert locate_key(ctx, :a) == :none
+      assert total_size(ctx) == size_before
     end
   end
 
@@ -516,21 +662,21 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       # Evict :a from window to probation
       process([write_event(:b), write_event(:c)], ctx, window_max: 1)
 
-      # :a should now be in probation (evicted through admission)
-      # (:b pushed :a out, :c pushed :b out — both admitted to empty/growing probation)
-      if locate_key(ctx, :a) == :probation do
-        # Read :a — promotes to protected
-        process([read_event(:a)], ctx)
-        assert locate_key(ctx, :a) == :protected
+      # :a and :b were promoted to probation (window overflow, no capacity
+      # pressure → no discards)
+      assert locate_key(ctx, :a) == :probation
 
-        # Read :a again — touches in protected
-        process([read_event(:a)], ctx)
-        assert locate_key(ctx, :a) == :protected
+      # Read :a — promotes to protected
+      process([read_event(:a)], ctx)
+      assert locate_key(ctx, :a) == :protected
 
-        # Delete :a
-        process([delete_event(:a)], ctx)
-        assert locate_key(ctx, :a) == :none
-      end
+      # Read :a again — touches in protected
+      process([read_event(:a)], ctx)
+      assert locate_key(ctx, :a) == :protected
+
+      # Delete :a
+      process([delete_event(:a)], ctx)
+      assert locate_key(ctx, :a) == :none
     end
 
     test "re-admission: evicted key re-written and re-admitted", ctx do
@@ -601,9 +747,8 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       # Window should have at most 3 entries
       assert AccessOrderDeque.size(ctx.window) <= 3
 
-      # All keys should be accounted for somewhere or discarded by admission
-      assert total_size(ctx) <= 20
-      assert total_size(ctx) > 0
+      # No capacity pressure → every key is retained (window or probation)
+      assert total_size(ctx) == 20
     end
   end
 
@@ -640,10 +785,12 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       boost_frequency(ctx.sketch, :candidate, 5)
       AccessOrderDeque.put(ctx.probation, :victim)
 
+      # Total (3) > max_size (2) forces one admission round
       process(
         [write_event(:candidate), write_event(:pusher)],
         ctx,
-        window_max: 1
+        window_max: 1,
+        max_size: 2
       )
 
       # :candidate's frequency (5 + 1 from write = 6) > :victim's (0)
@@ -656,16 +803,18 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       boost_frequency(ctx.sketch, :hot, 20)
       assert FrequencySketch.frequency(ctx.sketch, :hot) == 15
 
-      # Should still work normally in admission
+      # Should still work normally in admission (over capacity)
       AccessOrderDeque.put(ctx.probation, :cold)
 
       process(
         [write_event(:hot), write_event(:pusher)],
         ctx,
-        window_max: 1
+        window_max: 1,
+        max_size: 2
       )
 
       assert AccessOrderDeque.member?(ctx.probation, :hot)
+      refute AccessOrderDeque.member?(ctx.probation, :cold)
     end
   end
 
@@ -691,10 +840,12 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       # mirrors the real hot path (cache.put inserts before scheduling).
       :ets.insert(ctx.data_tab, {:pusher, "pusher_value"})
 
+      # Total (3) > max_size (2) forces one admission round
       process(
         [write_event(:unpopular), write_event(:pusher)],
         ctx,
         window_max: 1,
+        max_size: 2,
         data_tab: ctx.data_tab
       )
 
@@ -717,10 +868,12 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       # mirrors the real hot path (cache.put inserts before scheduling).
       :ets.insert(ctx.data_tab, {:pusher, "pusher_value"})
 
+      # Total (3) > max_size (2) forces one admission round
       process(
         [write_event(:high_freq), write_event(:pusher)],
         ctx,
         window_max: 1,
+        max_size: 2,
         data_tab: ctx.data_tab
       )
 
@@ -804,15 +957,17 @@ defmodule Nebulex.TinyLFU.MaintenanceTest do
       boost_frequency(ctx.sketch, :popular)
       AccessOrderDeque.put(ctx.probation, :popular)
 
-      # Eviction happens but no crash since data_tab is nil
+      # Over capacity → admission evicts :unpopular from the deque, but no
+      # crash since data_tab is nil (nothing to delete from ETS)
       process(
         [write_event(:unpopular), write_event(:pusher)],
         ctx,
-        window_max: 1
+        window_max: 1,
+        max_size: 2
       )
 
-      # Just verify it doesn't crash
       assert AccessOrderDeque.member?(ctx.probation, :popular)
+      refute AccessOrderDeque.member?(ctx.probation, :unpopular)
     end
   end
 

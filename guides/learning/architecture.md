@@ -124,46 +124,72 @@ The architecture separates cache operations into two distinct paths:
 
 This separation means cache operations never block on eviction decisions.
 
+## Derived Drain Defaults
+
+For bounded caches, `Nebulex.TinyLFU.Maintenance.Supervisor` derives
+per-buffer early-drain settings when the user does not set the `drain_*`
+keys in `:buffer_opts`. Explicit values always win and apply to all three
+buffers; unbounded caches start no maintenance pipeline at all.
+
+| Buffer | `drain_threshold` | Grounding |
+|---|---|---|
+| Write buffer | `max(1, min(128, div(max_size, partitions)))` | Caffeine's `WRITE_BUFFER_MAX` (128 x NCPU) per partition, capped by `max_size` so small caches drain before the buffer dwarfs them |
+| Read buffer | `64` | Caffeine's per-stripe read-buffer capacity. Keeps the frequency sketch fresh between interval ticks; without it, post-burst hot-set retention drops measurably |
+| Maintenance queue | `1` | Events are already coalesced upstream, so drain whenever work exists. Removes the second timed stage from the pipeline; churn stays bounded by the check interval |
+
+All buffers use `drain_check_interval = max(50, div(processing_interval, 10))`
+— 100ms at the default 1s interval. This bounds worst-case policy lag at
+roughly twice the check interval instead of twice the `processing_interval`,
+at the cost of one `O(1)` size check per partition per tick.
+`:processing_interval` remains the idle fallback and staleness ceiling.
+
+The numbers are validated by the drain-tuning benchmark
+(`benchmarks/drain_tuning.exs`), which measures hit rate, `max_size`
+overshoot, post-burst policy lag, hot-set retention, and maintenance churn
+across drain configurations.
+
 ## Admission Flow
 
-When a new entry is written to the cache:
+When a new entry is written to the cache, it enters the Window; once the
+Window is full, its LRU is promoted to Probation. Nothing is discarded at
+this point — while the cache is under `max_size`, promotion is the whole
+story (matching Caffeine's `evictFromWindow`).
 
 ```ascii
-  ┌─────────┐     ┌────────────┐     ┌────────────────┐
-  │  Client │────>│  Window    │────>│  Probation     │
-  │  put(k) │     │  (add key) │     │  (if admitted) │
-  └─────────┘     └─────┬──────┘     └────────────────┘
-                        │
-                  Window full?
-                        │
-                       yes
-                        │
-                        ▼
-               ┌──────────────────┐
-               │  Evict LRU from  │
-               │  Window          │
-               │  (window_victim) │
-               └────────┬─────────┘
-                        │
-                        ▼
+  ┌─────────┐     ┌────────────┐   Window full?   ┌────────────────┐
+  │  Client │────>│  Window    │───── promote ───>│  Probation     │
+  │  put(k) │     │  (add key) │    LRU (always)  │  (candidate)   │
+  └─────────┘     └────────────┘                  └────────────────┘
+```
+
+The TinyLFU admission filter runs **only under capacity pressure**
+(matching Caffeine's `evictFromMain`). After each maintenance batch, while
+`total size > max_size`, the batch's promoted candidates are compared
+against the Probation LRU:
+
+```ascii
                ┌─────────────────────────────────────┐
-               │  Peek LRU from Probation            │
-               │  (main_victim)                      │
+               │  candidate = next window-promoted   │
+               │              key (promotion order)  │
+               │  victim    = LRU from Probation     │
                │                                     │
-               │  freq(window_victim)                │
-               │    > freq(main_victim)?             │
+               │  freq(candidate) > freq(victim)?    │
                │                                     │
-               │  YES: admit window_victim           │
-               │       to Probation,                 │
-               │       evict main_victim             │
+               │  YES: evict victim,                 │
+               │       retain candidate              │
                │                                     │
-               │  NO:  discard window_victim         │
+               │  NO:  evict candidate               │
+               │       (ties retain the victim)      │
+               │                                     │
+               │  No candidates left?                │
+               │       evict LRU (Probation →        │
+               │       Protected → Window)           │
                └─────────────────────────────────────┘
 ```
 
 The FrequencySketch provides the `freq()` estimates. This comparison is the core
-of the TinyLFU admission policy — it only admits entries that are likely more
-valuable than what's already in the cache.
+of the TinyLFU admission policy — under capacity pressure, it only admits
+entries that are likely more valuable than what's already in the cache.
 
 ## Promotion Flow
 
@@ -233,6 +259,9 @@ When a Probation entry is accessed (read):
     │                    │               │                     │   in sketch
     │                    │               │                     │── add to Window
     │                    │               │                     │── if Window full:
+    │                    │               │                     │   promote LRU to
+    │                    │               │                     │   Probation
+    │                    │               │                     │── if over max_size:
     │                    │               │                     │   run admission
 ```
 
@@ -240,8 +269,10 @@ When a Probation entry is accessed (read):
 2. Client appends a write event to the Write Buffer via `put_newer` (deduped).
 3. Write Buffer processor periodically pushes deduped events to the Maintenance
    Queue.
-4. Maintenance Queue processor increments the key in the FrequencySketch, adds
-   it to the Window deque, and runs the admission flow if the Window is full.
+4. Maintenance Queue processor increments the key in the FrequencySketch and
+   adds it to the Window deque, promoting the Window LRU to Probation when the
+   Window is full. After the batch, if the cache is over `max_size`, the
+   admission filter decides which entries to evict.
 
 ## Sequence: `cache.delete(key)`
 

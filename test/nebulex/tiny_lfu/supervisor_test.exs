@@ -54,6 +54,91 @@ defmodule Nebulex.TinyLFU.SupervisorTest do
     end
   end
 
+  describe "derived drain defaults" do
+    # The supervisor derives Caffeine-aligned per-buffer drain defaults from
+    # max_size and the processing interval (see benchmarks/RESULTS.md).
+    # Assertions inspect the running Tidefall partitions, so they cover the
+    # options actually in effect, not just the derivation function.
+
+    test "bounded cache derives differentiated per-buffer thresholds" do
+      name = Module.concat(__MODULE__, DerivedDefaults)
+
+      start_supervised!(
+        {TinyLFUSupervisor,
+         name: name, max_size: 100_000, buffer_opts: [processing_interval: 1_000, partitions: 2]},
+        id: name
+      )
+
+      # Write buffer: max(1, min(128, div(100_000, 2))) = 128
+      assert drain_settings(Maintenance.write_buffer_name(name)) == [{128, 100}, {128, 100}]
+
+      # Read buffer: 64
+      assert drain_settings(Maintenance.read_buffer_name(name)) == [{64, 100}, {64, 100}]
+
+      # Maintenance queue: 1 (single partition)
+      assert drain_settings(Maintenance.queue_name(name)) == [{1, 100}]
+    end
+
+    test "small max_size caps the write-buffer threshold" do
+      name = Module.concat(__MODULE__, SmallCache)
+
+      start_supervised!(
+        {TinyLFUSupervisor,
+         name: name, max_size: 10, buffer_opts: [processing_interval: 1_000, partitions: 2]},
+        id: name
+      )
+
+      # max(1, min(128, div(10, 2))) = 5
+      assert drain_settings(Maintenance.write_buffer_name(name)) == [{5, 100}, {5, 100}]
+    end
+
+    test "drain_check_interval derives from processing_interval with a 50ms floor" do
+      name = Module.concat(__MODULE__, FastInterval)
+
+      start_supervised!(
+        {TinyLFUSupervisor,
+         name: name, max_size: 1_000, buffer_opts: [processing_interval: 100, partitions: 1]},
+        id: name
+      )
+
+      # max(50, div(100, 10)) = 50
+      assert drain_settings(Maintenance.queue_name(name)) == [{1, 50}]
+    end
+
+    test "explicit drain_threshold wins over the derived defaults for all buffers" do
+      name = Module.concat(__MODULE__, ExplicitThreshold)
+
+      start_supervised!(
+        {TinyLFUSupervisor,
+         name: name,
+         max_size: 100_000,
+         buffer_opts: [processing_interval: 1_000, partitions: 1, drain_threshold: 7]},
+        id: name
+      )
+
+      # User threshold applies to all three buffers; check interval stays derived
+      assert drain_settings(Maintenance.read_buffer_name(name)) == [{7, 100}]
+      assert drain_settings(Maintenance.write_buffer_name(name)) == [{7, 100}]
+      assert drain_settings(Maintenance.queue_name(name)) == [{7, 100}]
+    end
+
+    test "explicit drain_check_interval wins over the derived default" do
+      name = Module.concat(__MODULE__, ExplicitCheckInterval)
+
+      start_supervised!(
+        {TinyLFUSupervisor,
+         name: name,
+         max_size: 1_000,
+         buffer_opts: [processing_interval: 1_000, partitions: 1, drain_check_interval: 250]},
+        id: name
+      )
+
+      # Thresholds stay derived; the user's check interval applies
+      assert drain_settings(Maintenance.read_buffer_name(name)) == [{64, 250}]
+      assert drain_settings(Maintenance.queue_name(name)) == [{1, 250}]
+    end
+  end
+
   describe "end-to-end pipeline" do
     test "write events flow through write buffer to deques", %{name: name} do
       write_buffer = Maintenance.write_buffer_name(name)
@@ -118,5 +203,20 @@ defmodule Nebulex.TinyLFU.SupervisorTest do
       # :a should have been touched (moved to MRU), :b is now LRU
       assert AccessOrderDeque.peek_lru(window_deque) == {:ok, :b}
     end
+  end
+
+  ## Helpers
+
+  # Reads {drain_threshold, drain_check_interval} from each running Tidefall
+  # partition of the given buffer.
+  defp drain_settings(buffer) do
+    Tidefall.Registry
+    |> Registry.lookup(buffer)
+    |> Enum.map(fn {pid, _partition} ->
+      state = :sys.get_state(pid)
+
+      {state.drain_threshold, state.drain_check_interval}
+    end)
+    |> Enum.sort()
   end
 end

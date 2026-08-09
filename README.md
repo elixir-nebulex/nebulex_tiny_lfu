@@ -156,6 +156,10 @@ Where `BENCH_TEST_FILE` can be any of:
 
 * `frequency_sketch.exs` — micro-benchmark for the Count-Min Sketch
     used by the admission filter.
+* `drain_tuning.exs` — measures policy-side outcomes (hit rate, `max_size`
+    overshoot, policy lag, maintenance churn) across buffer drain
+    configurations, plus a hot-path guardrail. See the file header for the
+    environment knobs.
 
 ## Contributing
 
