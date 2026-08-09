@@ -100,16 +100,24 @@ defmodule Nebulex.Adapters.TinyLFU.Options do
           type: :pos_integer,
           required: false,
           doc: """
-          Optional per-partition item count that triggers an early drain, in
-          addition to the interval timer. Disabled (interval-only) by default.
+          Per-partition item count that triggers an early drain, in addition
+          to the interval timer. When unset, this adapter derives a
+          Caffeine-aligned default per buffer: write buffer
+          `max(1, min(128, div(max_size, partitions)))`, read buffer `64`,
+          maintenance queue `1`. An explicit value applies to all three
+          buffers. The derived defaults are validated by the drain-tuning
+          benchmark (`benchmarks/drain_tuning.exs`).
           """
         ],
         drain_check_interval: [
           type: :pos_integer,
           required: false,
           doc: """
-          Poll interval (ms) for the early-drain size check. Only relevant
-          when `:drain_threshold` is set; keep it below `:processing_interval`.
+          Poll interval (ms) for the early-drain size check. Defaults to
+          `max(50, div(processing_interval, 10))` here — 100ms at the default
+          `:processing_interval` (Tidefall's own default is 1 second). This
+          bounds the worst-case policy lag at roughly twice this value; keep
+          it below `:processing_interval`.
           """
         ],
         key_hasher: [

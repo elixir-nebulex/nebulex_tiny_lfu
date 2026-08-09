@@ -39,6 +39,23 @@ defmodule Nebulex.TinyLFU.Maintenance.Supervisor do
     :drain_check_interval
   ]
 
+  # Default buffer processing interval when not given in the buffer options
+  @default_processing_interval :timer.seconds(1)
+
+  # Derived read-buffer drain threshold (Caffeine's per-stripe read capacity)
+  @read_drain_threshold 64
+
+  # Cap for the derived write-buffer drain threshold (Caffeine's
+  # WRITE_BUFFER_MAX per partition)
+  @max_write_drain_threshold 128
+
+  # Derived maintenance-queue drain threshold (events are coalesced
+  # upstream — drain whenever work exists)
+  @queue_drain_threshold 1
+
+  # Floor for the derived drain check interval, in milliseconds
+  @min_drain_check_interval 50
+
   ## API
 
   @doc """
@@ -69,8 +86,10 @@ defmodule Nebulex.TinyLFU.Maintenance.Supervisor do
       |> Keyword.fetch!(:buffer_opts)
       |> Keyword.take(@buffer_option_keys)
 
-    # Maintenance queue always uses 1 partition (single-writer guarantee)
-    queue_opts = Keyword.put(buffer_opts, :partitions, 1)
+    # Per-buffer drain defaults derived from max_size and the processing
+    # interval; user-explicit drain_* values win
+    %{read: r_buffer_opts, write: w_buffer_opts, queue: queue_opts} =
+      derive_drain_opts(buffer_opts, max_size)
 
     # Fetch deque structs (deques are already running)
     [window_deque, probation_deque, protected_deque] =
@@ -118,8 +137,8 @@ defmodule Nebulex.TinyLFU.Maintenance.Supervisor do
 
     children = [
       {Tidefall.Queue, [name: queue_name, processor: maint_processor] ++ queue_opts},
-      {Tidefall.HashMap, [name: r_buffer_name, processor: buffer_processor] ++ buffer_opts},
-      {Tidefall.HashMap, [name: w_buffer_name, processor: buffer_processor] ++ buffer_opts}
+      {Tidefall.HashMap, [name: r_buffer_name, processor: buffer_processor] ++ r_buffer_opts},
+      {Tidefall.HashMap, [name: w_buffer_name, processor: buffer_processor] ++ w_buffer_opts}
     ]
 
     Supervisor.init(children, strategy: :rest_for_one)
@@ -129,4 +148,46 @@ defmodule Nebulex.TinyLFU.Maintenance.Supervisor do
 
   @doc false
   def sup_name(name), do: camelize_and_concat([name, MaintenanceSupervisor])
+
+  ## Drain-defaults derivation
+
+  # Derives Caffeine-aligned per-buffer drain defaults from `max_size` and
+  # the processing interval; user-explicit `drain_*` keys win and apply to
+  # all three buffers. See the "Derived Drain Defaults" section in the
+  # architecture guide (`guides/learning/architecture.md`) for the full
+  # rationale, validated by `benchmarks/drain_tuning.exs`.
+  #
+  # Public (but undocumented) so the drain-tuning bench can build its config
+  # grid from the real derivation instead of a copy that could drift.
+  @doc false
+  @spec derive_drain_opts(keyword(), pos_integer()) :: %{
+          read: keyword(),
+          write: keyword(),
+          queue: keyword()
+        }
+  def derive_drain_opts(buffer_opts, max_size) do
+    interval = Keyword.get(buffer_opts, :processing_interval, @default_processing_interval)
+    partitions = Keyword.get(buffer_opts, :partitions, System.schedulers_online())
+    check_interval = max(@min_drain_check_interval, div(interval, 10))
+    write_threshold = max(1, min(@max_write_drain_threshold, div(max_size, partitions)))
+
+    %{
+      read: drain_defaults(@read_drain_threshold, check_interval, buffer_opts),
+      write: drain_defaults(write_threshold, check_interval, buffer_opts),
+      # Maintenance queue always uses 1 partition (single-writer guarantee)
+      queue:
+        @queue_drain_threshold
+        |> drain_defaults(check_interval, buffer_opts)
+        |> Keyword.put(:partitions, 1)
+    }
+  end
+
+  # Per-buffer drain options: derived defaults overridden by any
+  # user-explicit `buffer_opts`.
+  defp drain_defaults(drain_threshold, check_interval, buffer_opts) do
+    Keyword.merge(
+      [drain_threshold: drain_threshold, drain_check_interval: check_interval],
+      buffer_opts
+    )
+  end
 end

@@ -34,6 +34,14 @@ a port of [Caffeine](https://github.com/ben-manes/caffeine)'s admission policy.
   `:processing_interval`, `:processing_timeout`, `:processing_batch_size`,
   `:partitions`, `:drain_threshold`, `:drain_check_interval`, and
   `:key_hasher`.
+- **Caffeine-aligned drain defaults** — when `drain_*` keys are not set,
+  per-buffer early-drain thresholds are derived from `:max_size` and the
+  processing interval (write buffer `max(1, min(128, max_size/partitions))`,
+  read buffer `64`, maintenance queue `1`, checked every
+  `processing_interval/10` with a 50ms floor). This bounds worst-case policy
+  lag at roughly twice the check interval instead of twice the processing
+  interval; explicit `drain_*` values always win. Backed by the drain-tuning
+  benchmark (`benchmarks/drain_tuning.exs`).
 - Standard `Nebulex.Cache` KV, Queryable, Info, Observable, and stats support.
 - Built on `:ets` with `:atomics` for the frequency sketch and `:tidefall` for
   the read/write event buffers and maintenance queue.

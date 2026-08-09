@@ -90,19 +90,24 @@ defmodule Nebulex.Adapters.TinyLFU do
   ### Admission and eviction
 
   Every new entry enters the window deque at MRU. Once the window is full,
-  its LRU is evicted and offered to the main cache:
+  its LRU is **promoted to probation** (at MRU). While the cache is under
+  `:max_size`, that is the whole story — nothing is ever discarded.
 
-    1. The candidate (window LRU) is compared against the **probation LRU**
-       (the "victim") via the FrequencySketch.
-    2. If `freq(candidate) > freq(victim)` → the candidate is admitted to
-       probation and the victim is evicted from the cache.
-    3. Otherwise the candidate is discarded (the more frequent victim wins).
+  When the total size exceeds `:max_size`, the maintenance worker runs the
+  TinyLFU admission filter (matching Caffeine's `evictFromMain`):
+
+    1. Each window-promoted candidate is compared against the **probation
+       LRU** (the "victim") via the FrequencySketch.
+    2. If `freq(candidate) > freq(victim)` → the victim is evicted from the
+       cache and the candidate is retained.
+    3. Otherwise the candidate is evicted (the more frequent victim wins;
+       ties retain the victim).
 
   A read on a probation entry **promotes** it to protected; if protected is
-  full, its LRU is **demoted** back to probation. After a write batch, if
-  the total deque size still exceeds `max_size`, the worker continues
-  evicting from the probation LRU (then protected, then window) until the
-  cap is honoured.
+  full, its LRU is **demoted** back to probation. If the total deque size
+  still exceeds `max_size` once candidates are exhausted, the worker
+  continues evicting from the probation LRU (then protected, then window)
+  until the cap is honoured.
 
   ## When to use
 
@@ -192,8 +197,11 @@ defmodule Nebulex.Adapters.TinyLFU do
 
   During a write burst this means ETS can momentarily hold more than
   `max_size` entries — enforcement catches up on the next maintenance
-  cycle. Caffeine has the same eventual-consistency property; if you need
-  a hard real-time cap, this isn't the adapter for you.
+  cycle. With the derived drain defaults the catch-up window is bounded by
+  the `:drain_check_interval` (~100ms at defaults) rather than the full
+  `:processing_interval`, but Caffeine has the same eventual-consistency
+  property; if you need a hard real-time cap, this isn't the adapter for
+  you.
 
   ## Caveats
 
@@ -203,10 +211,17 @@ defmodule Nebulex.Adapters.TinyLFU do
     * **Eventual `max_size` enforcement.** See the section above.
     * **Single-writer maintenance.** All deque mutations serialise through
       one process. Maintenance throughput scales with unique keys per
-      flush window, not raw op rate (the buffers deduplicate). For most
-      workloads this is plenty; for extreme key-cardinality bursts, tune
-      `:processing_interval` and `:processing_batch_size` (see options
-      above).
+      drain, not raw op rate (the buffers deduplicate). The derived drain
+      defaults bound how long buffered events wait (~2x the drain check
+      interval); the policy engine's throughput ceiling itself is a single
+      core.
+    * **No backpressure under saturating unique-key floods.** A sustained
+      write flood of always-new keys can grow the ETS table far past
+      `max_size` for as long as the flood outpaces the single-writer
+      policy engine — drain tuning bounds staleness, not throughput. Bench
+      evidence: a saturating scan grew a 10k-cap cache into the millions
+      of entries regardless of drain settings. If your workload can
+      include unbounded unique-key floods, cap them upstream of the cache.
     * **No `:replace` in `put_all/2`.** `put_all` supports `:put` and
       `:put_new`. Use single-key `replace/3` for conditional updates.
     * **Complex keys.** Any term works as a cache key out of the box: the

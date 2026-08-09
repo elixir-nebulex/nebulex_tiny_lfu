@@ -112,7 +112,8 @@ defmodule NebulexTinyLfu.MixProject do
       main: "Nebulex.Adapters.TinyLFU",
       source_ref: "v#{@version}",
       source_url: @source_url,
-      canonical: "https://hexdocs.pm/nebulex_tiny_lfu"
+      canonical: "https://hexdocs.pm/nebulex_tiny_lfu",
+      extras: ["guides/learning/architecture.md"]
     ]
   end
 
