@@ -40,6 +40,52 @@ architecture, the admission/eviction flow, and tuning notes.
 
 [online_docs]: https://hexdocs.pm/nebulex_tiny_lfu
 
+## How it compares
+
+Both numbers below come from the scripts in [benchmarks/](./benchmarks),
+which reproduce them end to end (see [Benchmarks](#benchmarks)).
+
+### Against Caffeine
+
+Does the W-TinyLFU label hold? Replaying the standard cache-trace corpus
+(ARC S3/DS1, LIRS gli/loop) through the adapter with a synchronized policy
+(`benchmarks/trace_replay.exs`) lands within ~1 point of Caffeine's
+published W-TinyLFU hit rates on 11 of the 12 published trace × size points,
+worst delta −2.3. The loop trace has no published number; against an
+analytic scan-resistance ideal it lands within 1.3 points at three of four
+sizes, worst −4.6. A sample point per trace:
+
+| trace (requests)  | cache size | this adapter | Caffeine W-TinyLFU | LRU   |
+| ----------------- | ---------- | ------------ | ------------------ | ----- |
+| ARC S3 (16.4M)    | 500,000    | 49.9%        | ~51%               | 22.8% |
+| ARC DS1 (43.7M)   | 5,000,000  | 51.2%        | ~52%               | 21.0% |
+| LIRS gli (6k)     | 1,000      | 49.7%        | ~50%               | 11.2% |
+| LIRS loop (505k)  | 750        | 69.6%        | —                  | 0.0%  |
+
+Caffeine references are read from the [Caffeine wiki's Efficiency
+charts][caffeine-efficiency] (±1pt); the LRU column is an exact LRU
+simulated on the same parsed traces. The script header documents the known
+differences: Caffeine's admission jitter, window rounding, and its adaptive
+window sizing against the fixed 1% window here, which shows up most on
+recency-biased traces.
+
+### Against `Nebulex.Adapters.Local`
+
+Local's raw operations are ~6–8× faster. A `get` there is a bare ETS lookup
+(~0.5 µs median), while this adapter's read path also writes a policy event
+on every hit (~3.7 µs). What that buys is hit rate: at equal worst-case
+capacity this adapter scores 2–10× higher on the same trace corpus
+(S3 @ 500k: 49.9% vs 11.4%; DS1 @ 5M: 51.2% vs 18.3%; loop: 97.6% vs 0.0%,
+since generational clearing collapses on looping and scanning patterns the
+same way LRU does), and `max_size` enforcement under saturating writes stays
+~3× tighter (`benchmarks/adapter_comparison.exs`).
+
+Rule of thumb: if a miss costs more than a few microseconds (a query, an
+RPC), the hit rate is what matters. If the cache itself is your hot path and
+misses are cheap, Local's raw speed wins.
+
+[caffeine-efficiency]: https://github.com/ben-manes/caffeine/wiki/Efficiency
+
 ## Installation
 
 Add `:nebulex_tiny_lfu` to your list of dependencies in `mix.exs`:
@@ -160,6 +206,15 @@ Where `BENCH_TEST_FILE` can be any of:
     overshoot, policy lag, maintenance churn) across buffer drain
     configurations, plus a hot-path guardrail. See the file header for the
     environment knobs.
+* `trace_replay.exs` — replays the standard cache-trace corpus (ARC S3/DS1,
+    LIRS gli/loop) with a synchronized policy and compares hit rates against
+    Caffeine's published W-TinyLFU numbers plus an exact LRU baseline. The
+    file header covers the methodology and where to get the traces, which
+    aren't bundled because some have unclear licenses.
+* `adapter_comparison.exs` — head-to-head against `Nebulex.Adapters.Local`:
+    per-op latency (Benchee), saturating mixed throughput, and `max_size`
+    enforcement under pressure. Pair it with `TRACE_ADAPTER=local` on
+    `trace_replay.exs` for the capacity-comparable hit-rate half.
 
 ## Contributing
 
