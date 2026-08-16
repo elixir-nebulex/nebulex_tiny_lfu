@@ -31,54 +31,13 @@
 #
 # Relative deltas between configs are the signal, not absolute numbers.
 
+Code.require_file("support/helpers.exs", __DIR__)
+
 defmodule Bench.Cache do
   @moduledoc false
   use Nebulex.Cache,
     otp_app: :nebulex_tiny_lfu,
     adapter: Nebulex.Adapters.TinyLFU
-end
-
-defmodule Bench.Zipf do
-  @moduledoc false
-  # Zipfian key sampling via inverse CDF. Builds the cumulative weights once,
-  # presamples a large pool of keys, and workloads then index uniformly into
-  # the pool — preserving the zipf frequency profile with O(1) per-op cost.
-
-  @doc "Presamples `sample_size` zipf-distributed keys from `1..keyspace`."
-  def presample(keyspace, skew, sample_size) do
-    cdf = build_cdf(keyspace, skew)
-    total = elem(cdf, keyspace - 1)
-
-    1..sample_size
-    |> Enum.map(fn _ -> bsearch(cdf, :rand.uniform() * total, 0, keyspace - 1) + 1 end)
-    |> List.to_tuple()
-  end
-
-  defp build_cdf(keyspace, skew) do
-    {cumulative, _acc} =
-      Enum.map_reduce(1..keyspace, 0.0, fn rank, acc ->
-        acc = acc + 1.0 / :math.pow(rank, skew)
-
-        {acc, acc}
-      end)
-
-    List.to_tuple(cumulative)
-  end
-
-  # Smallest index whose cumulative weight covers `r`
-  defp bsearch(cdf, r, lo, hi) when lo < hi do
-    mid = div(lo + hi, 2)
-
-    if elem(cdf, mid) < r do
-      bsearch(cdf, r, mid + 1, hi)
-    else
-      bsearch(cdf, r, lo, mid)
-    end
-  end
-
-  defp bsearch(_cdf, _r, lo, _hi) do
-    lo
-  end
 end
 
 defmodule Bench.Churn do
@@ -164,7 +123,7 @@ defmodule Bench.Sampler do
       {:DOWN, ^ref, :process, _pid, reason} ->
         raise "sampler died: #{inspect(reason)}"
     after
-      5_000 -> raise "timeout waiting for sampler result"
+      :timer.seconds(5) -> raise "timeout waiting for sampler result"
     end
   end
 
@@ -209,39 +168,30 @@ defmodule Bench.Runner do
   ## Parameters
 
   def params! do
-    quick? = truthy?("BENCH_QUICK")
-    interval = env_int("BENCH_INTERVAL_MS", 1_000)
-    max_size = env_int("BENCH_MAX_SIZE", 10_000)
+    quick? = Bench.Env.truthy?("BENCH_QUICK")
+    interval = Bench.Env.int("BENCH_INTERVAL_MS", 1_000)
+    max_size = Bench.Env.int("BENCH_MAX_SIZE", 10_000)
 
     %{
       quick?: quick?,
       interval: interval,
       max_size: max_size,
-      keyspace: env_int("BENCH_KEYSPACE", max_size * 10),
+      keyspace: Bench.Env.int("BENCH_KEYSPACE", max_size * 10),
       skew: 1.0,
       sample_size: 131_072,
       # Leave scheduler headroom for the maintenance pipeline itself
-      workers: env_int("BENCH_WORKERS", max(2, System.schedulers_online() - 2)),
-      warm_ms: env_int("BENCH_WARM_MS", if(quick?, do: 500, else: 3_000)),
-      time_ms: env_int("BENCH_TIME_MS", if(quick?, do: 1_500, else: 10_000)),
+      workers: Bench.Env.int("BENCH_WORKERS", max(2, System.schedulers_online() - 2)),
+      warm_ms: Bench.Env.int("BENCH_WARM_MS", if(quick?, do: 500, else: 3_000)),
+      time_ms: Bench.Env.int("BENCH_TIME_MS", if(quick?, do: 1_500, else: 10_000)),
       burst_factor: 5,
       probe_n: 10_000,
       sample_interval: 10,
       partitions: System.schedulers_online(),
       batch_size: 100,
-      skip_guardrail?: quick? or truthy?("BENCH_SKIP_GUARDRAIL"),
-      guardrail_time: env_int("BENCH_GUARDRAIL_TIME_S", 3)
+      skip_guardrail?: quick? or Bench.Env.truthy?("BENCH_SKIP_GUARDRAIL"),
+      guardrail_time: Bench.Env.int("BENCH_GUARDRAIL_TIME_S", 3)
     }
   end
-
-  defp env_int(name, default) do
-    case System.get_env(name) do
-      nil -> default
-      value -> String.to_integer(value)
-    end
-  end
-
-  defp truthy?(name), do: System.get_env(name) in ~w(1 true)
 
   ## Config grid
 
@@ -498,38 +448,15 @@ defmodule Bench.Runner do
 
   # Cache-aside read: fill on miss
   defp fetch_or_fill(key) do
-    with {:error, _reason} <- Cache.fetch(key) do
-      Cache.put!(key, key)
-    end
+    Bench.Workers.fetch_or_fill(Cache, key)
   end
 
   ## Workers
 
-  # Runs `workers` concurrent processes calling `step.(worker_index, i)` in a
+  # Runs `workers` concurrent processes against the dynamic cache `name` in a
   # tight loop until the deadline. Returns total ops executed.
   def run_workers(name, workers, duration_ms, step) do
-    deadline = System.monotonic_time(:millisecond) + duration_ms
-
-    1..workers
-    |> Enum.map(fn worker ->
-      Task.async(fn ->
-        Cache.put_dynamic_cache(name)
-
-        worker_loop(worker, deadline, step, 0)
-      end)
-    end)
-    |> Task.await_many(:infinity)
-    |> Enum.sum()
-  end
-
-  defp worker_loop(worker, deadline, step, i) do
-    if System.monotonic_time(:millisecond) >= deadline do
-      i
-    else
-      step.(worker, i)
-
-      worker_loop(worker, deadline, step, i + 1)
-    end
+    Bench.Workers.run(Cache, name, workers, duration_ms, step)
   end
 
   defp run_flood(name, workers, keys_per_worker) do
@@ -646,6 +573,8 @@ end
 defmodule Bench.Report do
   @moduledoc false
 
+  import Bench.Fmt
+
   def print_header(params, configs) do
     drains =
       Enum.map_join(configs, "\n", fn
@@ -743,29 +672,6 @@ defmodule Bench.Report do
 
   defp lag({:ok, ms}), do: num(ms)
   defp lag({:timeout, size}), do: "timeout (size=#{num(size)})"
-
-  defp md_table(rows, headers) do
-    widths =
-      [headers | rows]
-      |> Enum.zip_with(fn cells -> cells |> Enum.map(&String.length/1) |> Enum.max() end)
-
-    separator = Enum.map(widths, &String.duplicate("-", &1))
-
-    [headers, separator | rows]
-    |> Enum.map_join("\n", fn cells ->
-      cells
-      |> Enum.zip_with(widths, &String.pad_trailing/2)
-      |> Enum.join(" | ")
-      |> then(&("| " <> &1 <> " |"))
-    end)
-    |> Kernel.<>("\n")
-  end
-
-  defp pct(value), do: flt(value, 2) <> "%"
-
-  defp flt(value, decimals), do: :erlang.float_to_binary(value / 1, decimals: decimals)
-
-  defp num(value), do: value |> Integer.to_string() |> String.replace(~r/\d(?=(\d{3})+$)/, "\\0,")
 end
 
 # ---------------------------------------------------------------------------
@@ -792,14 +698,4 @@ results =
     Runner.run_scenario(scenario, config, params, keys)
   end
 
-report = Report.render(results, params, configs)
-
-File.mkdir_p!("benchmarks/output")
-
-timestamp = DateTime.utc_now() |> Calendar.strftime("%Y%m%d-%H%M%S")
-report_file = "benchmarks/output/drain_tuning-#{timestamp}.md"
-
-File.write!(report_file, report)
-
-IO.puts("\n" <> report)
-IO.puts("Report written to #{report_file}")
+Bench.Fmt.write_report!("drain_tuning", Report.render(results, params, configs))

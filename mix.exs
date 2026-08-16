@@ -62,6 +62,7 @@ defmodule NebulexTinyLfu.MixProject do
       # Benchmark Test
       {:benchee, "~> 1.5", only: [:dev, :test]},
       {:benchee_html, "~> 1.0", only: [:dev, :test]},
+      {:nebulex_local, "~> 3.0", only: [:dev, :test]},
 
       # Usage Rules
       {:usage_rules, "~> 1.0", only: [:dev]},
@@ -73,7 +74,7 @@ defmodule NebulexTinyLfu.MixProject do
 
   defp nebulex_dep do
     if path = System.get_env("NEBULEX_PATH") do
-      {:nebulex, path: path}
+      {:nebulex, path: path, override: true}
     else
       {:nebulex, "~> 3.0"}
     end

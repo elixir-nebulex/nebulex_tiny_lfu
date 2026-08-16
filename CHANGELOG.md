@@ -42,6 +42,12 @@ a port of [Caffeine](https://github.com/ben-manes/caffeine)'s admission policy.
   lag at roughly twice the check interval instead of twice the processing
   interval; explicit `drain_*` values always win. Backed by the drain-tuning
   benchmark (`benchmarks/drain_tuning.exs`).
+- **Validated hit rates** — `benchmarks/trace_replay.exs` replays the standard
+  cache-trace corpus (ARC S3/DS1, LIRS gli/loop) with a synchronized policy and
+  compares against Caffeine's published W-TinyLFU numbers: within ~1 point on
+  11 of the 12 published trace × size points.
+  `benchmarks/adapter_comparison.exs` measures the trade-off against
+  `Nebulex.Adapters.Local`; see the README's "How it compares" section.
 - Standard `Nebulex.Cache` KV, Queryable, Info, Observable, and stats support.
 - Built on `:ets` with `:atomics` for the frequency sketch and `:tidefall` for
   the read/write event buffers and maintenance queue.
